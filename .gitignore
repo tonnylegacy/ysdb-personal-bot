@@ -1,0 +1,8 @@
+.env
+data/db/*.sqlite
+data/db/*.sqlite-shm
+data/db/*.sqlite-wal
+data/runtime/*.json
+imports/whatsapp/*.txt
+imports/whatsapp/*.zip
+imports/daily-results/*.txt

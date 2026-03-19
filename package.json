@@ -1,0 +1,17 @@
+{
+  "name": "ysdb-personal-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal WhatsApp-to-Telegram conversion bot for YSDB lead nurturing.",
+  "scripts": {
+    "setup": "node src/cli.js setup",
+    "init": "node src/cli.js init",
+    "ingest": "node src/cli.js ingest",
+    "leads": "node src/cli.js leads",
+    "invites": "node src/cli.js draft-invites",
+    "result": "node src/cli.js draft-result",
+    "tasks": "node src/cli.js tasks",
+    "admin": "node src/admin-server.js",
+    "bot": "node src/bot.js"
+  }
+}
