@@ -124,6 +124,16 @@ function getDashboardData() {
   };
 }
 
+function updateLeadStage(contactId, leadStage) {
+  getDb().prepare("UPDATE contacts SET lead_stage = ?, updated_at = ? WHERE id = ?").run(leadStage, nowIso(), contactId);
+  return getContactDetail(contactId);
+}
+
+function completeTask(taskId) {
+  getDb().prepare("UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?").run(nowIso(), taskId);
+  return { ok: true, taskId };
+}
+
 module.exports = {
   getLeadBoard,
   draftInviteMessages,
@@ -131,5 +141,7 @@ module.exports = {
   getRecentInvites,
   getLatestDailyResult,
   getContactDetail,
-  getDashboardData
+  getDashboardData,
+  updateLeadStage,
+  completeTask
 };

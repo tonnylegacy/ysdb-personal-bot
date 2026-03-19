@@ -1,9 +1,12 @@
 const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
 const { config } = require("./config");
 const { initDb } = require("./db");
-const { ingestWhatsAppInputs } = require("./whatsapp-parser");
+const { ingestWhatsAppInputs, ingestWhatsAppFile } = require("./whatsapp-parser");
 const { draftDailyResultFromFile } = require("./daily-results");
-const { draftInviteMessages, getContactDetail, getDashboardData } = require("./operations");
+const { draftInviteMessages, getContactDetail, getDashboardData, updateLeadStage, completeTask } = require("./operations");
+const { ensureDir, slugify } = require("./utils");
 
 function sendJson(res, value) {
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -51,6 +54,8 @@ function pageHtml() {
     .quicklist { display:grid; gap:10px; }
     .quickitem { padding:12px 14px; border-radius:16px; background:rgba(246,234,210,.66); border:1px solid var(--line); }
     .quickitem strong { display:block; font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-bottom:6px; }
+    .quickitem textarea, .quickitem input { width:100%; margin-top:8px; border:1px solid var(--line); background:#fffdf8; border-radius:14px; padding:12px; font:14px/1.45 "Segoe UI", sans-serif; color:var(--ink); }
+    .quickitem textarea { min-height:120px; resize:vertical; }
     .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:16px; margin-top:18px; }
     .card { padding:18px; }
     .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:18px; }
@@ -80,6 +85,9 @@ function pageHtml() {
     .message.out { background:#f0f6ff; }
     .message-head { font:600 12px/1.3 "Segoe UI", sans-serif; color:var(--muted); margin-bottom:6px; }
     .footer-note { margin-top:16px; color:var(--muted); font-size:13px; }
+    .inline-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .tiny { padding:8px 12px; font-size:12px; }
+    select { border:1px solid var(--line); border-radius:999px; padding:9px 12px; background:#fffdf8; font:600 13px/1 "Segoe UI", sans-serif; }
     @media (max-width: 1000px) {
       .hero { grid-template-columns:1fr; }
       .metrics { grid-template-columns:repeat(2,1fr); }
@@ -105,7 +113,17 @@ function pageHtml() {
       <aside class="hero-side">
         <div class="quickitem"><strong>What This Solves</strong>See warm leads, generate personal invite copy, and push good conversations into Telegram without working directly in code.</div>
         <div class="quickitem"><strong>Input Folders</strong><span id="paths"></span></div>
-        <div class="quickitem"><strong>Daily Result Flow</strong>Drop today's text into <code>imports/daily-results/today.txt</code>, then click <em>Draft Today's Result</em>.</div>
+        <div class="quickitem">
+          <strong>Paste WhatsApp Chat</strong>
+          <input id="chat-name" placeholder="lead-name-or-date">
+          <textarea id="chat-text" placeholder="Paste exported WhatsApp chat text here"></textarea>
+          <div class="inline-actions"><button class="btn-soft tiny" onclick="submitChat()">Save + Ingest Chat</button></div>
+        </div>
+        <div class="quickitem">
+          <strong>Paste Daily Result</strong>
+          <textarea id="result-text" placeholder="Paste today's YSDB result text here"></textarea>
+          <div class="inline-actions"><button class="btn-soft tiny" onclick="submitResult()">Save + Draft Result</button></div>
+        </div>
       </aside>
     </div>
     <div id="app"></div>
@@ -175,7 +193,7 @@ function pageHtml() {
             <table>
               <thead><tr><th>Lead</th><th>Priority</th><th>Title</th></tr></thead>
               <tbody>
-                \${data.tasks.map(task => \`<tr><td>\${task.name || ''}</td><td>\${task.priority}</td><td>\${task.title}</td></tr>\`).join('')}
+                \${data.tasks.map(task => \`<tr><td>\${task.name || ''}</td><td>\${task.priority}</td><td>\${task.title}<div class="inline-actions"><button class="btn-soft tiny" onclick="completeTask(\${task.id})">Mark Done</button></div></td></tr>\`).join('')}
               </tbody>
             </table>
           </div>
@@ -197,10 +215,10 @@ function pageHtml() {
           <div class="card panel-right">
             <div class="section-title">How To Work Here</div>
             <div class="stack">
-              <div class="detail-box">1. Export WhatsApp chats as <code>.txt</code> into <code>imports/whatsapp</code>.</div>
-              <div class="detail-box">2. Click <strong>Ingest WhatsApp Chats</strong>.</div>
-              <div class="detail-box">3. Review leads and click <strong>Refresh Invite Drafts</strong>.</div>
-              <div class="detail-box">4. Paste today's YSDB result text into <code>imports/daily-results/today.txt</code>, then click <strong>Draft Today's Result</strong>.</div>
+              <div class="detail-box">1. Paste a WhatsApp export into the chat box and save it directly from the browser.</div>
+              <div class="detail-box">2. Review stages and refresh invite drafts.</div>
+              <div class="detail-box">3. Paste today's YSDB result text into the result box and draft it in one click.</div>
+              <div class="detail-box">4. Copy invite messages and send manually on WhatsApp, then continue on Telegram after opt-in.</div>
             </div>
           </div>
         </div>\`;
@@ -235,6 +253,15 @@ function pageHtml() {
             <span class="badge \${c.lead_stage}">\${c.lead_stage}</span>
             <div class="muted" style="margin-top:8px;">Interest \${fmt(c.trading_interest)} | Reply \${fmt(c.response_likelihood)} | IB \${fmt(c.ib_candidate_score)}</div>
             <div class="muted" style="margin-top:8px;">Objection: \${c.objection_summary || 'none'} | Telegram: \${c.telegram_username ? '@' + c.telegram_username : 'not linked'}</div>
+            <div class="inline-actions">
+              <select id="lead-stage-select" onchange="changeLeadStage(\${c.id}, this.value)">
+                <option value="hot_lead" \${c.lead_stage === 'hot_lead' ? 'selected' : ''}>hot_lead</option>
+                <option value="warm_lead" \${c.lead_stage === 'warm_lead' ? 'selected' : ''}>warm_lead</option>
+                <option value="ib_candidate" \${c.lead_stage === 'ib_candidate' ? 'selected' : ''}>ib_candidate</option>
+                <option value="cold" \${c.lead_stage === 'cold' ? 'selected' : ''}>cold</option>
+              </select>
+              <button class="btn-soft tiny" onclick="copyLatestDraft()">Copy Latest Draft</button>
+            </div>
           </div>
           <div class="detail-box">
             <div class="section-title" style="margin-bottom:10px;">Conversation Summary</div>
@@ -246,9 +273,86 @@ function pageHtml() {
           </div>
           <div class="detail-box">
             <div class="section-title" style="margin-bottom:10px;">Invite Drafts</div>
-            <div class="stack">\${data.drafts.map(item => \`<div class="message"><div class="message-head">\${item.created_at}</div><div>\${item.body}</div></div>\`).join('') || '<div class="muted">No drafts for this lead yet.</div>'}</div>
+            <div class="stack">\${data.drafts.map((item, index) => \`<div class="message"><div class="message-head">\${item.created_at}</div><div data-draft-body="\${index === 0 ? 'latest' : 'older'}" data-copy="\${encodeURIComponent(item.body)}">\${item.body}</div><div class="inline-actions"><button class="btn-soft tiny" onclick="copyEncoded(this.parentNode.parentNode.querySelector('[data-copy]').dataset.copy)">Copy</button></div></div>\`).join('') || '<div class="muted">No drafts for this lead yet.</div>'}</div>
           </div>
         </div>\`;
+    }
+
+    async function submitChat() {
+      const filename = document.getElementById('chat-name').value.trim();
+      const content = document.getElementById('chat-text').value.trim();
+      if (!content) {
+        setStatus('Paste a WhatsApp chat first.');
+        return;
+      }
+      setStatus('Saving and ingesting chat...');
+      const result = await api('/api/actions/importChat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename, content })
+      });
+      document.getElementById('chat-text').value = '';
+      setStatus('Chat imported.');
+      await loadDashboard();
+      if (result.contactId) loadLead(result.contactId);
+    }
+
+    async function submitResult() {
+      const content = document.getElementById('result-text').value.trim();
+      if (!content) {
+        setStatus('Paste a daily result first.');
+        return;
+      }
+      setStatus('Saving and drafting daily result...');
+      await api('/api/actions/saveResult', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content })
+      });
+      document.getElementById('result-text').value = '';
+      setStatus('Daily result drafted.');
+      await loadDashboard();
+    }
+
+    async function changeLeadStage(contactId, leadStage) {
+      setStatus('Updating lead stage...');
+      await api('/api/actions/stage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contactId, leadStage })
+      });
+      setStatus('Lead stage updated.');
+      await loadDashboard();
+      await loadLead(contactId);
+    }
+
+    async function copyText(value) {
+      await navigator.clipboard.writeText(value);
+      setStatus('Copied to clipboard.');
+    }
+
+    async function copyEncoded(value) {
+      await copyText(decodeURIComponent(value));
+    }
+
+    async function copyLatestDraft() {
+      const draftEl = document.querySelector('[data-draft-body="latest"]');
+      if (!draftEl) {
+        setStatus('No draft available to copy.');
+        return;
+      }
+      await copyText(draftEl.textContent);
+    }
+
+    async function completeTask(taskId) {
+      setStatus('Completing task...');
+      await api('/api/actions/taskComplete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ taskId })
+      });
+      setStatus('Task completed.');
+      await loadDashboard();
     }
 
     loadDashboard();
@@ -281,6 +385,17 @@ function startServer() {
       sendJson(res, { ok: true, result: await ingestWhatsAppInputs() });
       return;
     }
+    if (req.method === "POST" && reqPath === "/api/actions/importChat") {
+      const body = await readJsonBody(req);
+      ensureDir(config.whatsappImportsDir);
+      const filename = `${slugify(body.filename || "chat") || "chat"}-${Date.now()}.txt`;
+      const filePath = path.join(config.whatsappImportsDir, filename);
+      fs.writeFileSync(filePath, String(body.content || ""), "utf8");
+      const result = await ingestWhatsAppFile(filePath);
+      const detail = result.imported ? getDashboardData().leads.find((lead) => lead.name === result.contactName) : null;
+      sendJson(res, { ok: true, result, filePath, contactId: detail?.id || null });
+      return;
+    }
     if (req.method === "POST" && reqPath === "/api/actions/draftInvites") {
       sendJson(res, { ok: true, result: draftInviteMessages() });
       return;
@@ -288,6 +403,24 @@ function startServer() {
     if (req.method === "POST" && reqPath === "/api/actions/draftResult") {
       await readJsonBody(req);
       sendJson(res, { ok: true, result: await draftDailyResultFromFile() });
+      return;
+    }
+    if (req.method === "POST" && reqPath === "/api/actions/saveResult") {
+      const body = await readJsonBody(req);
+      ensureDir(config.dailyResultsDir);
+      const filePath = path.join(config.dailyResultsDir, "today.txt");
+      fs.writeFileSync(filePath, String(body.content || ""), "utf8");
+      sendJson(res, { ok: true, result: await draftDailyResultFromFile(filePath) });
+      return;
+    }
+    if (req.method === "POST" && reqPath === "/api/actions/stage") {
+      const body = await readJsonBody(req);
+      sendJson(res, { ok: true, result: updateLeadStage(Number(body.contactId), String(body.leadStage || "warm_lead")) });
+      return;
+    }
+    if (req.method === "POST" && reqPath === "/api/actions/taskComplete") {
+      const body = await readJsonBody(req);
+      sendJson(res, completeTask(Number(body.taskId)));
       return;
     }
     if (reqPath === "/") {

@@ -158,4 +158,4 @@ async function ingestWhatsAppInputs(targetPath) {
   return results;
 }
 
-module.exports = { ingestWhatsAppInputs };
+module.exports = { ingestWhatsAppInputs, ingestWhatsAppFile };
