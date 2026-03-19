@@ -1,38 +1,25 @@
 const http = require("node:http");
-const path = require("node:path");
-const fs = require("node:fs");
 const { config } = require("./config");
-const { initDb, getDb } = require("./db");
+const { initDb } = require("./db");
+const { ingestWhatsAppInputs } = require("./whatsapp-parser");
+const { draftDailyResultFromFile } = require("./daily-results");
+const { draftInviteMessages, getContactDetail, getDashboardData } = require("./operations");
 
 function sendJson(res, value) {
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(value, null, 2));
 }
 
-function getDashboardData() {
-  const db = getDb();
-  return {
-    leads: db.prepare(`
-      SELECT id, name, phone, lead_stage, trading_interest, response_likelihood, ib_candidate_score, last_engagement_at
-      FROM contacts
-      WHERE contact_key NOT LIKE 'telegram:%'
-      ORDER BY CASE lead_stage WHEN 'hot_lead' THEN 1 WHEN 'warm_lead' THEN 2 WHEN 'ib_candidate' THEN 3 ELSE 4 END,
-               response_likelihood DESC
-    `).all(),
-    tasks: db.prepare(`
-      SELECT t.id, c.name, t.type, t.priority, t.title, t.details, t.status
-      FROM tasks t LEFT JOIN contacts c ON c.id = t.contact_id
-      WHERE t.status = 'open'
-      ORDER BY t.priority ASC, t.id DESC
-    `).all(),
-    invites: db.prepare(`
-      SELECT om.id, c.name, om.channel, om.message_type, om.status, om.body, om.created_at
-      FROM outbound_messages om LEFT JOIN contacts c ON c.id = om.contact_id
-      WHERE om.message_type = 'invite_draft'
-      ORDER BY om.id DESC LIMIT 30
-    `).all(),
-    latestResult: db.prepare("SELECT * FROM daily_results ORDER BY result_date DESC LIMIT 1").get()
-  };
+function sendHtml(res, value) {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(value);
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  return text ? JSON.parse(text) : {};
 }
 
 function pageHtml() {
@@ -43,74 +30,147 @@ function pageHtml() {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>YSDB Personal Bot Admin</title>
   <style>
-    :root { --bg:#0d1321; --card:#111a2d; --soft:#1b2846; --text:#f2f5ff; --muted:#97a5c6; --accent:#4fd1c5; --warm:#ffb454; --hot:#ff6b6b; }
+    :root { --bg:#f4efe2; --ink:#151515; --muted:#6b675d; --panel:#fff8ea; --panel-2:#f6ead2; --line:#d8c8a7; --green:#157f62; --amber:#a96a16; --red:#b7423a; --shadow:0 20px 45px rgba(73,45,5,.12); }
     * { box-sizing:border-box; }
-    body { margin:0; font-family:Segoe UI, sans-serif; background:linear-gradient(160deg,#0a1020,#10192d 60%,#0f2744); color:var(--text); }
-    .wrap { max-width:1180px; margin:0 auto; padding:32px 20px 48px; }
-    h1 { margin:0 0 8px; font-size:32px; }
-    p { margin:0; color:var(--muted); }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; margin-top:24px; }
-    .card { background:rgba(17,26,45,.92); border:1px solid rgba(151,165,198,.15); border-radius:18px; padding:18px; box-shadow:0 18px 40px rgba(0,0,0,.25); }
-    .section-title { font-size:14px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:14px; }
-    .metric { font-size:28px; font-weight:700; }
+    body { margin:0; font-family:Georgia, "Segoe UI", sans-serif; color:var(--ink); background:
+      radial-gradient(circle at top left, rgba(255,255,255,.5), transparent 28%),
+      linear-gradient(160deg,#f7f0e3,#f4efe2 55%,#eadfc6); }
+    .wrap { max-width:1320px; margin:0 auto; padding:30px 18px 56px; }
+    .hero { display:grid; grid-template-columns:1.4fr .9fr; gap:16px; align-items:stretch; }
+    .hero-main,.hero-side,.card { background:rgba(255,248,234,.92); border:1px solid var(--line); border-radius:24px; box-shadow:var(--shadow); }
+    .hero-main { padding:26px; position:relative; overflow:hidden; }
+    .hero-main:before { content:""; position:absolute; inset:auto -8% -35% auto; width:260px; height:260px; background:radial-gradient(circle, rgba(21,127,98,.18), transparent 65%); }
+    .hero-side { padding:20px; display:grid; gap:14px; }
+    h1 { margin:0 0 8px; font-size:38px; line-height:1; letter-spacing:-.03em; }
+    .subtitle { margin:0; color:var(--muted); font-size:16px; max-width:720px; }
+    .toolbar { margin-top:22px; display:flex; flex-wrap:wrap; gap:10px; }
+    button { border:0; border-radius:999px; padding:11px 16px; font:600 14px/1 "Segoe UI", sans-serif; cursor:pointer; }
+    .btn-primary { background:var(--ink); color:#fff; }
+    .btn-soft { background:var(--panel-2); color:var(--ink); border:1px solid var(--line); }
+    .status { padding:12px 14px; border-radius:16px; background:#fffdf8; border:1px dashed var(--line); color:var(--muted); min-height:48px; }
+    .quicklist { display:grid; gap:10px; }
+    .quickitem { padding:12px 14px; border-radius:16px; background:rgba(246,234,210,.66); border:1px solid var(--line); }
+    .quickitem strong { display:block; font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-bottom:6px; }
+    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:16px; margin-top:18px; }
+    .card { padding:18px; }
+    .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:18px; }
+    .metric { background:#fffdf8; border:1px solid var(--line); border-radius:18px; padding:16px; }
+    .metric-label { font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:10px; }
+    .metric-value { font:700 30px/1 "Segoe UI", sans-serif; }
+    .section-title { font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-bottom:14px; font-family:"Segoe UI", sans-serif; }
     table { width:100%; border-collapse:collapse; }
-    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(151,165,198,.12); vertical-align:top; }
-    th { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(216,200,167,.7); vertical-align:top; }
+    th { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-family:"Segoe UI", sans-serif; }
     td { font-size:14px; }
+    tbody tr { cursor:pointer; }
+    tbody tr:hover { background:rgba(246,234,210,.5); }
     .badge { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; font-weight:700; }
-    .hot_lead { background:rgba(255,107,107,.16); color:#ff9090; }
-    .warm_lead { background:rgba(255,180,84,.16); color:#ffd18a; }
-    .ib_candidate { background:rgba(79,209,197,.16); color:#7ce7de; }
-    .cold, .new { background:rgba(151,165,198,.12); color:#bcc8e6; }
-    pre { margin:0; white-space:pre-wrap; font-family:Consolas, monospace; font-size:13px; color:#d7def5; }
+    .hot_lead { background:rgba(183,66,58,.12); color:var(--red); }
+    .warm_lead { background:rgba(169,106,22,.14); color:var(--amber); }
+    .ib_candidate { background:rgba(21,127,98,.14); color:var(--green); }
+    .cold, .new { background:rgba(107,103,93,.12); color:#6b675d; }
+    pre { margin:0; white-space:pre-wrap; font-family:Consolas, monospace; font-size:13px; color:#2e2a23; }
     .muted { color:var(--muted); }
+    .panel-left { grid-column:span 7; }
+    .panel-right { grid-column:span 5; }
+    .detail { display:grid; gap:14px; }
+    .detail-box { background:#fffdf8; border:1px solid var(--line); border-radius:18px; padding:14px; }
+    .stack { display:grid; gap:10px; }
+    .message { padding:10px 12px; border-radius:14px; background:#fffdf8; border:1px solid var(--line); }
+    .message.out { background:#f0f6ff; }
+    .message-head { font:600 12px/1.3 "Segoe UI", sans-serif; color:var(--muted); margin-bottom:6px; }
+    .footer-note { margin-top:16px; color:var(--muted); font-size:13px; }
+    @media (max-width: 1000px) {
+      .hero { grid-template-columns:1fr; }
+      .metrics { grid-template-columns:repeat(2,1fr); }
+      .panel-left, .panel-right { grid-column:span 12; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>YSDB Personal Bot Admin</h1>
-    <p>Local dashboard for leads, tasks, invite drafts, and daily result prep.</p>
+    <div class="hero">
+      <section class="hero-main">
+        <h1>Tony's Conversion Desk</h1>
+        <p class="subtitle">A local sales cockpit for WhatsApp lead recovery, Telegram nurturing, and daily YSDB proof-based follow-up without living in terminal commands.</p>
+        <div class="toolbar">
+          <button class="btn-primary" onclick="runAction('ingest')">Ingest WhatsApp Chats</button>
+          <button class="btn-soft" onclick="runAction('draftInvites')">Refresh Invite Drafts</button>
+          <button class="btn-soft" onclick="runAction('draftResult')">Draft Today's Result</button>
+          <button class="btn-soft" onclick="loadDashboard()">Refresh Board</button>
+        </div>
+        <div id="status" class="status" style="margin-top:16px;">Ready.</div>
+        <div class="metrics" id="metrics"></div>
+      </section>
+      <aside class="hero-side">
+        <div class="quickitem"><strong>What This Solves</strong>See warm leads, generate personal invite copy, and push good conversations into Telegram without working directly in code.</div>
+        <div class="quickitem"><strong>Input Folders</strong><span id="paths"></span></div>
+        <div class="quickitem"><strong>Daily Result Flow</strong>Drop today's text into <code>imports/daily-results/today.txt</code>, then click <em>Draft Today's Result</em>.</div>
+      </aside>
+    </div>
     <div id="app"></div>
+    <div class="footer-note">Local only. Telegram sending still requires your bot token in <code>.env</code> and user opt-in.</div>
   </div>
   <script>
-    async function load() {
-      const res = await fetch('/api/dashboard');
-      const data = await res.json();
-      const app = document.getElementById('app');
+    let selectedLeadId = null;
+
+    function fmt(num) {
+      return Number(num || 0).toFixed(2);
+    }
+
+    function setStatus(text) {
+      document.getElementById('status').textContent = text;
+    }
+
+    async function api(url, options = {}) {
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    function renderMetrics(data) {
       const hot = data.leads.filter(x => x.lead_stage === 'hot_lead').length;
       const warm = data.leads.filter(x => x.lead_stage === 'warm_lead').length;
       const ib = data.leads.filter(x => x.lead_stage === 'ib_candidate').length;
+      document.getElementById('metrics').innerHTML = [
+        ['Hot Leads', hot],
+        ['Warm Leads', warm],
+        ['IB Prospects', ib],
+        ['Open Tasks', data.tasks.length]
+      ].map(item => \`<div class="metric"><div class="metric-label">\${item[0]}</div><div class="metric-value">\${item[1]}</div></div>\`).join('');
+    }
+
+    async function loadDashboard() {
+      setStatus('Loading dashboard...');
+      const data = await api('/api/dashboard');
+      const app = document.getElementById('app');
+      renderMetrics(data);
+      document.getElementById('paths').innerHTML = \`WhatsApp: <code>imports/whatsapp</code><br>Results: <code>imports/daily-results</code>\`;
       app.innerHTML = \`
         <div class="grid">
-          <div class="card"><div class="section-title">Hot Leads</div><div class="metric">\${hot}</div></div>
-          <div class="card"><div class="section-title">Warm Leads</div><div class="metric">\${warm}</div></div>
-          <div class="card"><div class="section-title">IB Prospects</div><div class="metric">\${ib}</div></div>
-          <div class="card"><div class="section-title">Open Tasks</div><div class="metric">\${data.tasks.length}</div></div>
-        </div>
-        <div class="grid">
-          <div class="card" style="grid-column:span 2;">
+          <div class="card panel-left">
             <div class="section-title">Lead Board</div>
             <table>
-              <thead><tr><th>Name</th><th>Stage</th><th>Interest</th><th>Reply</th><th>IB</th><th>Last Engagement</th></tr></thead>
+              <thead><tr><th>Name</th><th>Stage</th><th>Interest</th><th>Reply</th><th>IB</th><th>Telegram</th></tr></thead>
               <tbody>
-                \${data.leads.map(lead => \`<tr>
-                  <td>\${lead.name}</td>
+                \${data.leads.map(lead => \`<tr onclick="loadLead(\${lead.id})">
+                  <td><strong>\${lead.name}</strong><div class="muted">\${lead.phone || ''}</div></td>
                   <td><span class="badge \${lead.lead_stage}">\${lead.lead_stage}</span></td>
-                  <td>\${Number(lead.trading_interest).toFixed(2)}</td>
-                  <td>\${Number(lead.response_likelihood).toFixed(2)}</td>
-                  <td>\${Number(lead.ib_candidate_score).toFixed(2)}</td>
-                  <td class="muted">\${lead.last_engagement_at || ''}</td>
+                  <td>\${fmt(lead.trading_interest)}</td>
+                  <td>\${fmt(lead.response_likelihood)}</td>
+                  <td>\${fmt(lead.ib_candidate_score)}</td>
+                  <td class="muted">\${lead.telegram_username ? '@' + lead.telegram_username : (lead.opted_in_telegram ? 'opted in' : 'not linked')}</td>
                 </tr>\`).join('')}
               </tbody>
             </table>
           </div>
-          <div class="card">
-            <div class="section-title">Latest Daily Result</div>
-            \${data.latestResult ? \`<pre>\${data.latestResult.summary_text}\\n\\n\${data.latestResult.takeaway_text}\\n\\n\${data.latestResult.cta_text}</pre>\` : '<p class="muted">No result loaded yet.</p>'}
+          <div class="card panel-right">
+            <div class="section-title">Lead Detail</div>
+            <div id="lead-detail" class="detail-box muted">Pick a lead from the board to review summary, chat lines, and invite drafts.</div>
           </div>
         </div>
         <div class="grid">
-          <div class="card">
+          <div class="card panel-left">
             <div class="section-title">Open Tasks</div>
             <table>
               <thead><tr><th>Lead</th><th>Priority</th><th>Title</th></tr></thead>
@@ -119,7 +179,13 @@ function pageHtml() {
               </tbody>
             </table>
           </div>
-          <div class="card">
+          <div class="card panel-right">
+            <div class="section-title">Latest Daily Result</div>
+            \${data.latestResult ? \`<pre>\${data.latestResult.summary_text}\\n\\n\${data.latestResult.takeaway_text}\\n\\n\${data.latestResult.cta_text}</pre>\` : '<p class="muted">No result loaded yet.</p>'}
+          </div>
+        </div>
+        <div class="grid">
+          <div class="card panel-left">
             <div class="section-title">Invite Drafts</div>
             <table>
               <thead><tr><th>Lead</th><th>Message</th></tr></thead>
@@ -128,9 +194,64 @@ function pageHtml() {
               </tbody>
             </table>
           </div>
+          <div class="card panel-right">
+            <div class="section-title">How To Work Here</div>
+            <div class="stack">
+              <div class="detail-box">1. Export WhatsApp chats as <code>.txt</code> into <code>imports/whatsapp</code>.</div>
+              <div class="detail-box">2. Click <strong>Ingest WhatsApp Chats</strong>.</div>
+              <div class="detail-box">3. Review leads and click <strong>Refresh Invite Drafts</strong>.</div>
+              <div class="detail-box">4. Paste today's YSDB result text into <code>imports/daily-results/today.txt</code>, then click <strong>Draft Today's Result</strong>.</div>
+            </div>
+          </div>
+        </div>\`;
+      if (selectedLeadId) loadLead(selectedLeadId);
+      setStatus('Dashboard ready.');
+    }
+
+    async function runAction(action) {
+      const labels = {
+        ingest: 'Ingesting WhatsApp chats...',
+        draftInvites: 'Refreshing invite drafts...',
+        draftResult: 'Drafting daily result...'
+      };
+      setStatus(labels[action] || 'Working...');
+      try {
+        const result = await api('/api/actions/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        setStatus(JSON.stringify(result));
+        await loadDashboard();
+      } catch (error) {
+        setStatus('Error: ' + error.message);
+      }
+    }
+
+    async function loadLead(id) {
+      selectedLeadId = id;
+      const data = await api('/api/contact?id=' + id);
+      const c = data.contact;
+      document.getElementById('lead-detail').innerHTML = \`
+        <div class="detail">
+          <div class="detail-box">
+            <strong>\${c.name}</strong><br>
+            <span class="badge \${c.lead_stage}">\${c.lead_stage}</span>
+            <div class="muted" style="margin-top:8px;">Interest \${fmt(c.trading_interest)} | Reply \${fmt(c.response_likelihood)} | IB \${fmt(c.ib_candidate_score)}</div>
+            <div class="muted" style="margin-top:8px;">Objection: \${c.objection_summary || 'none'} | Telegram: \${c.telegram_username ? '@' + c.telegram_username : 'not linked'}</div>
+          </div>
+          <div class="detail-box">
+            <div class="section-title" style="margin-bottom:10px;">Conversation Summary</div>
+            \${data.conversations.map(item => \`<div style="margin-bottom:10px;"><strong>\${item.source_file}</strong><div class="muted">\${item.summary || ''}</div></div>\`).join('') || '<div class="muted">No conversation summary yet.</div>'}
+          </div>
+          <div class="detail-box">
+            <div class="section-title" style="margin-bottom:10px;">Recent Messages</div>
+            <div class="stack">\${data.messages.map(msg => \`<div class="message \${msg.direction}"><div class="message-head">\${msg.sender_name} · \${msg.sent_at || ''}</div><div>\${msg.body}</div></div>\`).join('') || '<div class="muted">No messages.</div>'}</div>
+          </div>
+          <div class="detail-box">
+            <div class="section-title" style="margin-bottom:10px;">Invite Drafts</div>
+            <div class="stack">\${data.drafts.map(item => \`<div class="message"><div class="message-head">\${item.created_at}</div><div>\${item.body}</div></div>\`).join('') || '<div class="muted">No drafts for this lead yet.</div>'}</div>
+          </div>
         </div>\`;
     }
-    load();
+
+    loadDashboard();
   </script>
 </body>
 </html>`;
@@ -138,15 +259,39 @@ function pageHtml() {
 
 function startServer() {
   initDb();
-  const server = http.createServer((req, res) => {
-    const reqPath = new URL(req.url, "http://127.0.0.1").pathname;
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const reqPath = url.pathname;
     if (reqPath === "/api/dashboard") {
       sendJson(res, getDashboardData());
       return;
     }
+    if (reqPath === "/api/contact") {
+      const id = Number(url.searchParams.get("id"));
+      const detail = getContactDetail(id);
+      if (!detail) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Contact not found");
+        return;
+      }
+      sendJson(res, detail);
+      return;
+    }
+    if (req.method === "POST" && reqPath === "/api/actions/ingest") {
+      sendJson(res, { ok: true, result: await ingestWhatsAppInputs() });
+      return;
+    }
+    if (req.method === "POST" && reqPath === "/api/actions/draftInvites") {
+      sendJson(res, { ok: true, result: draftInviteMessages() });
+      return;
+    }
+    if (req.method === "POST" && reqPath === "/api/actions/draftResult") {
+      await readJsonBody(req);
+      sendJson(res, { ok: true, result: await draftDailyResultFromFile() });
+      return;
+    }
     if (reqPath === "/") {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(pageHtml());
+      sendHtml(res, pageHtml());
       return;
     }
     res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
